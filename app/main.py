@@ -14,7 +14,6 @@ HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
 app = FastAPI()
 
-
 # ----------------------------------------------------------------------
 # Modelos disponibles (pensados para una 3090)
 # ----------------------------------------------------------------------
@@ -54,7 +53,6 @@ modelo_activo = None
 modelo_base = None    # referencia al modelo activo (AutoModelForCausalLM)
 tokenizer = None      # tokenizer activo
 
-
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
@@ -78,12 +76,12 @@ def construir_prompt_chat(mensaje_usuario: str) -> str:
 
     texto = mensaje_usuario.strip()
 
-    # Formato "chat" estándar
+    # Por ahora: un solo turno de usuario
     messages = [
         {"role": "user", "content": texto}
     ]
 
-    # 1) Intentar usar apply_chat_template (lo recomendado para modelos instruct/chat)
+    # 1) Intentar usar apply_chat_template (recomendado en modelos instruct/chat)
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             prompt = tokenizer.apply_chat_template(
@@ -97,7 +95,7 @@ def construir_prompt_chat(mensaje_usuario: str) -> str:
             pass
 
     # 2) Fallback a formato instruct manual
-    if usa_formato_instruct(modelo_activo):
+    if modelo_activo is not None and usa_formato_instruct(modelo_activo):
         return f"<s>[INST] {texto} [/INST]"
 
     # 3) Último recurso: prompt plano
@@ -173,6 +171,10 @@ def select_model(input: ModeloInput):
                 trust_remote_code=True
             )
 
+        # Asegurar pad_token_id para generación estable
+        if getattr(modelo_local.config, "pad_token_id", None) is None:
+            modelo_local.config.pad_token_id = modelo_local.config.eos_token_id
+
         modelo_local.eval()
         modelos[nombre] = {
             "model": modelo_local,
@@ -230,6 +232,7 @@ def unload_model():
 def predict(data: Consulta):
     """
     Genera una respuesta con el modelo activo.
+    Esta será la interfaz que usará EconAgent (más adelante).
     """
     global modelo_activo, modelo_base, tokenizer
 
@@ -244,15 +247,18 @@ def predict(data: Consulta):
     if first_param is None:
         raise RuntimeError("El modelo activo no tiene parámetros, no se puede inferir el dispositivo.")
     device = first_param.device
+
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    # Generación
-    outputs = modelo_base.generate(
-        **inputs,
-        max_new_tokens=data.max_tokens,
-        do_sample=(data.temperature > 0.0),
-        temperature=data.temperature,
-    )
+    # Generación (sin gradientes)
+    with torch.inference_mode():
+        outputs = modelo_base.generate(
+            **inputs,
+            max_new_tokens=data.max_tokens,
+            do_sample=(data.temperature > 0.0),
+            temperature=data.temperature,
+            pad_token_id=modelo_base.config.pad_token_id,
+        )
 
     decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
