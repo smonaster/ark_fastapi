@@ -7,7 +7,7 @@ import gc
 from dotenv import load_dotenv
 
 # ----------------------------------------------------------------------
-# Carga variables de entorno (.env opcional)
+# Load environment variables (.env optional)
 # ----------------------------------------------------------------------
 load_dotenv()
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
@@ -15,73 +15,72 @@ HF_TOKEN = os.environ.get("HF_TOKEN", None)
 app = FastAPI()
 
 # ----------------------------------------------------------------------
-# Modelos disponibles (pensados para una 3090)
+# Available models (targeting a 3090)
 # ----------------------------------------------------------------------
-MODELOS_DISPONIBLES = {
-    # Buen generalista actual, contexto largo, requiere token
+AVAILABLE_MODELS = {
+    # Strong generalist, long context, requires token
     "llama31-8b": {
         "id": "meta-llama/Llama-3.1-8B-Instruct",
         "needs_token": True,
-        "quant": None,   # FP16, cabe bien en 24 GB
+        "quant": None,   # FP16 fits in 24 GB
     },
 
-    # Fuerte en código/razonamiento, no requiere token
+    # Good for code/reasoning, does not require token
     "qwen25-7b": {
         "id": "Qwen/Qwen2.5-7B-Instruct",
         "needs_token": False,
         "quant": None,   # FP16 ok
     },
 
-    # Modelo de razonamiento (distill de DeepSeek-R1), requiere token
+    # Reasoning model (distill of DeepSeek-R1), requires token
     "deepseek-r1-qwen-7b": {
         "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "needs_token": True,
-        "quant": None,   # puedes cambiar a 4-bit si quieres en el futuro
+        "quant": None,   # you can switch to 4-bit if needed
     },
 
-    # Modelo algo más grande (12B), mejor cargarlo cuantizado
+    # Slightly larger model (12B), better load it quantized
     "mistral-nemo-12b": {
         "id": "mistralai/Mistral-Nemo-Instruct-2407",
         "needs_token": True,
-        "quant": 4,      # 4-bit para ir cómodo en 24 GB
+        "quant": 4,      # 4-bit to be comfortable in 24 GB
     },
 }
 
-# Cache de modelos ya cargados
-modelos = {}          # nombre -> { "model": ..., "tokenizer": ... }
-modelo_activo = None
-modelo_base = None    # referencia al modelo activo (AutoModelForCausalLM)
-tokenizer = None      # tokenizer activo
+# Cache of loaded models
+loaded_models = {}          # alias -> { "model": ..., "tokenizer": ... }
+active_model_name = None
+active_model = None         # reference to active AutoModelForCausalLM
+tokenizer = None            # active tokenizer
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-def usa_formato_instruct(nombre: str) -> bool:
+def uses_instruct_format(model_name: str) -> bool:
     """
-    Por si necesitamos un fallback manual tipo [INST] ... [/INST].
-    La vía principal es usar apply_chat_template si existe.
+    Fallback to instruct style [INST] ... [/INST] when chat template is unavailable.
     """
-    return nombre in MODELOS_DISPONIBLES.keys()
+    return model_name in AVAILABLE_MODELS.keys()
 
 
-def construir_prompt_chat(mensaje_usuario: str) -> str:
+def build_chat_prompt(user_message: str) -> str:
     """
-    Construye el prompt usando el chat template del tokenizer si existe.
-    Si no, hace fallback a formato instruct o texto plano.
+    Build the prompt using the tokenizer chat template when available.
+    Falls back to instruct format or plain text otherwise.
     """
-    global tokenizer, modelo_activo
+    global tokenizer, active_model_name
 
     if tokenizer is None:
-        raise RuntimeError("Tokenizer no inicializado.")
+        raise RuntimeError("Tokenizer not initialized.")
 
-    texto = mensaje_usuario.strip()
+    text = user_message.strip()
 
-    # Por ahora: un solo turno de usuario
+    # Single user turn for now
     messages = [
-        {"role": "user", "content": texto}
+        {"role": "user", "content": text}
     ]
 
-    # 1) Intentar usar apply_chat_template (recomendado en modelos instruct/chat)
+    # 1) Prefer tokenizer.apply_chat_template for instruct/chat models
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             prompt = tokenizer.apply_chat_template(
@@ -91,137 +90,137 @@ def construir_prompt_chat(mensaje_usuario: str) -> str:
             )
             return prompt
         except Exception:
-            # Si algo falla, seguimos con fallback
+            # If something fails, fallback
             pass
 
-    # 2) Fallback a formato instruct manual
-    if modelo_activo is not None and usa_formato_instruct(modelo_activo):
-        return f"<s>[INST] {texto} [/INST]"
+    # 2) Manual instruct format fallback
+    if active_model_name is not None and uses_instruct_format(active_model_name):
+        return f"<s>[INST] {text} [/INST]"
 
-    # 3) Último recurso: prompt plano
-    return texto
+    # 3) Last resort: plain prompt
+    return text
 
 
 # ----------------------------------------------------------------------
-# Esquemas de entrada/salida
+# Request/response schemas
 # ----------------------------------------------------------------------
-class ModeloInput(BaseModel):
-    nombre: str
+class ModelSelection(BaseModel):
+    name: str
 
 from typing import Optional
 
-class Consulta(BaseModel):
-    mensaje: str
-    max_tokens: int = 300              # número máx. de tokens de respuesta
-    temperature: float = 0.0           # 0 => determinista, >0 => sampling
-    top_p: Optional[float] = None      # nucleus sampling (opcional)
-    top_k: Optional[int] = None        # top-k sampling (opcional)
+class PredictionRequest(BaseModel):
+    message: str
+    max_tokens: int = 300              # maximum response tokens
+    temperature: float = 0.0           # 0 => deterministic, >0 => sampling
+    top_p: Optional[float] = None      # nucleus sampling (optional)
+    top_k: Optional[int] = None        # top-k sampling (optional)
 
 
 # ----------------------------------------------------------------------
 # Endpoints
 # ----------------------------------------------------------------------
 @app.post("/select-model")
-def select_model(input: ModeloInput):
+def select_model(selection: ModelSelection):
     """
-    Carga (si hace falta) e instancia un modelo como activo.
+    Download (if needed) and set a model as active.
     """
-    global modelo_activo, modelo_base, tokenizer, modelos
+    global active_model_name, active_model, tokenizer, loaded_models
 
-    nombre = input.nombre
+    name = selection.name
 
-    if nombre not in MODELOS_DISPONIBLES:
-        raise HTTPException(status_code=404, detail=f"Modelo '{nombre}' no está disponible.")
+    if name not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Model '{name}' is not available.")
 
-    cfg = MODELOS_DISPONIBLES[nombre]
-    modelo_id = cfg["id"]
-    needs_token = cfg["needs_token"]
-    quant = cfg["quant"]
+    model_cfg = AVAILABLE_MODELS[name]
+    model_id = model_cfg["id"]
+    needs_token = model_cfg["needs_token"]
+    quant = model_cfg["quant"]
 
     if needs_token and HF_TOKEN is None:
         raise HTTPException(
             status_code=401,
-            detail=f"El modelo '{nombre}' requiere HF_TOKEN configurado en el entorno."
+            detail=f"Model '{name}' requires HF_TOKEN set in the environment."
         )
 
-    token_arg = HF_TOKEN if needs_token else None
+    auth_token = HF_TOKEN if needs_token else None
 
-    # Si el modelo no está aún en cache, descargarlo y cargarlo
-    if nombre not in modelos:
-        print(f"[INFO] Cargando modelo '{modelo_id}' (alias: {nombre}) ...")
+    # Download and cache if needed
+    if name not in loaded_models:
+        print(f"[INFO] Loading model '{model_id}' (alias: {name}) ...")
 
-        tokenizer_local = AutoTokenizer.from_pretrained(
-            modelo_id,
-            token=token_arg,
+        local_tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            token=auth_token,
             trust_remote_code=True
         )
 
         if quant == 4:
             quant_config = BitsAndBytesConfig(load_in_4bit=True)
-            modelo_local = AutoModelForCausalLM.from_pretrained(
-                modelo_id,
+            local_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
                 device_map="auto",
                 quantization_config=quant_config,
-                token=token_arg,
+                token=auth_token,
                 trust_remote_code=True
             )
         else:
-            modelo_local = AutoModelForCausalLM.from_pretrained(
-                modelo_id,
+            local_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
                 device_map="auto",
                 dtype=torch.float16,
-                token=token_arg,
+                token=auth_token,
                 trust_remote_code=True
             )
 
         # Asegurar pad_token_id para generación estable
-        if getattr(modelo_local.config, "pad_token_id", None) is None:
-            modelo_local.config.pad_token_id = modelo_local.config.eos_token_id
+        if getattr(local_model.config, "pad_token_id", None) is None:
+            local_model.config.pad_token_id = local_model.config.eos_token_id
 
-        modelo_local.eval()
-        modelos[nombre] = {
-            "model": modelo_local,
-            "tokenizer": tokenizer_local,
+        local_model.eval()
+        loaded_models[name] = {
+            "model": local_model,
+            "tokenizer": local_tokenizer,
         }
         gc.collect()
 
-    # Activar como modelo actual
-    modelo_activo = nombre
-    modelo_base = modelos[nombre]["model"]
-    tokenizer = modelos[nombre]["tokenizer"]
+    # Set active model
+    active_model_name = name
+    active_model = loaded_models[name]["model"]
+    tokenizer = loaded_models[name]["tokenizer"]
 
-    return {"message": f"Modelo '{nombre}' seleccionado y listo."}
+    return {"message": f"Model '{name}' selected and ready."}
 
 
 @app.get("/model-status")
 def model_status():
     """
-    Devuelve el nombre del modelo actualmente activo.
+    Return the current active model name.
     """
-    if modelo_activo is None:
-        raise HTTPException(status_code=404, detail="No hay modelo cargado.")
-    return {"modelo_activo": modelo_activo}
+    if active_model_name is None:
+        raise HTTPException(status_code=404, detail="No model is loaded.")
+    return {"active_model": active_model_name}
 
 
 @app.post("/unload-model")
 def unload_model():
     """
-    Descarga (desinstancia) el modelo activo de memoria.
+    Unload the active model from memory.
     """
-    global modelo_activo, modelo_base, tokenizer, modelos
+    global active_model_name, active_model, tokenizer, loaded_models
 
-    if modelo_activo is None:
-        raise HTTPException(status_code=400, detail="No hay modelo activo para descargar.")
+    if active_model_name is None:
+        raise HTTPException(status_code=400, detail="No active model to unload.")
 
-    print(f"[INFO] Descargando modelo '{modelo_activo}' de memoria...")
+    print(f"[INFO] Unloading model '{active_model_name}' from memory...")
 
     try:
-        del modelos[modelo_activo]
+        del loaded_models[active_model_name]
     except KeyError:
         pass
 
-    modelo_activo = None
-    modelo_base = None
+    active_model_name = None
+    active_model = None
     tokenizer = None
 
     gc.collect()
@@ -232,61 +231,60 @@ def unload_model():
 
 
 @app.post("/predict")
-def predict(data: Consulta):
+def predict(request: PredictionRequest):
     """
-    Genera una respuesta con el modelo activo.
-    Esta será la interfaz que usará EconAgent (más adelante).
+    Generate a response using the active model.
     """
-    global modelo_activo, modelo_base, tokenizer
+    global active_model_name, active_model, tokenizer
 
-    if modelo_activo is None or modelo_base is None or tokenizer is None:
-        raise HTTPException(status_code=400, detail="No hay modelo cargado.")
+    if active_model_name is None or active_model is None or tokenizer is None:
+        raise HTTPException(status_code=400, detail="No model is loaded.")
 
-    # Construir prompt adecuado para el modelo
-    prompt = construir_prompt_chat(data.mensaje)
+    # Build prompt for the active model
+    prompt = build_chat_prompt(request.message)
 
-    # Tokenizar y mover al dispositivo donde vive el modelo
-    first_param = next(modelo_base.parameters(), None)
+    # Tokenize and move to the device where the model lives
+    first_param = next(active_model.parameters(), None)
     if first_param is None:
-        raise RuntimeError("El modelo activo no tiene parámetros, no se puede inferir el dispositivo.")
+        raise RuntimeError("Active model has no parameters; cannot infer device.")
     device = first_param.device
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    # Argumentos comunes de generación
+    # Common generation arguments
     gen_kwargs = {
-        "max_new_tokens": data.max_tokens,
-        "pad_token_id": modelo_base.config.pad_token_id,
+        "max_new_tokens": request.max_tokens,
+        "pad_token_id": active_model.config.pad_token_id,
     }
 
-    # Modo sampling vs determinista
-    if data.temperature > 0.0:
-        # Sampling estocástico
+    # Sampling vs deterministic
+    if request.temperature > 0.0:
+        # Stochastic sampling
         gen_kwargs["do_sample"] = True
-        gen_kwargs["temperature"] = data.temperature
+        gen_kwargs["temperature"] = request.temperature
 
-        # Parámetros opcionales de sampling
-        if data.top_p is not None:
-            gen_kwargs["top_p"] = data.top_p
-        if data.top_k is not None:
-            gen_kwargs["top_k"] = data.top_k
+        # Optional sampling params
+        if request.top_p is not None:
+            gen_kwargs["top_p"] = request.top_p
+        if request.top_k is not None:
+            gen_kwargs["top_k"] = request.top_k
     else:
-        # Modo determinista (greedy / beam por defecto)
+        # Deterministic mode (greedy/beam by default)
         gen_kwargs["do_sample"] = False
 
-    # Generación (sin gradientes)
+    # Generation (no gradients)
     with torch.inference_mode():
-        outputs = modelo_base.generate(
+        outputs = active_model.generate(
             **inputs,
             **gen_kwargs,
         )
 
     decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-    # Limpieza ligera en caso de que el modelo devuelva parte del prompt instruct
+    # Trim instruct prompt if model echoes it
     if "[/INST]" in decoded:
         decoded = decoded.split("[/INST]", 1)[-1].strip()
 
-    respuesta = decoded.strip()
+    response_text = decoded.strip()
 
-    return {"respuesta": respuesta}
+    return {"response": response_text}
