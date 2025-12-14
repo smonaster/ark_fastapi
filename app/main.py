@@ -239,8 +239,12 @@ def predict(data: Consulta):
     # Construir prompt adecuado para el modelo
     prompt = construir_prompt_chat(data.mensaje)
 
-    # Tokenizar y mover al dispositivo del modelo
-    inputs = tokenizer(prompt, return_tensors="pt").to(modelo_base.device)
+    # Tokenizar y mover al dispositivo donde vive el modelo
+    first_param = next(modelo_base.parameters(), None)
+    if first_param is None:
+        raise RuntimeError("El modelo activo no tiene parámetros, no se puede inferir el dispositivo.")
+    device = first_param.device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     # Generación
     outputs = modelo_base.generate(
