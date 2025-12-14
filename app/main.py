@@ -108,11 +108,14 @@ def construir_prompt_chat(mensaje_usuario: str) -> str:
 class ModeloInput(BaseModel):
     nombre: str
 
+from typing import Optional
 
 class Consulta(BaseModel):
     mensaje: str
-    max_tokens: int = 300
-    temperature: float = 0.0
+    max_tokens: int = 300              # número máx. de tokens de respuesta
+    temperature: float = 0.0           # 0 => determinista, >0 => sampling
+    top_p: Optional[float] = None      # nucleus sampling (opcional)
+    top_k: Optional[int] = None        # top-k sampling (opcional)
 
 
 # ----------------------------------------------------------------------
@@ -166,7 +169,7 @@ def select_model(input: ModeloInput):
             modelo_local = AutoModelForCausalLM.from_pretrained(
                 modelo_id,
                 device_map="auto",
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 token=token_arg,
                 trust_remote_code=True
             )
@@ -250,14 +253,32 @@ def predict(data: Consulta):
 
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
+    # Argumentos comunes de generación
+    gen_kwargs = {
+        "max_new_tokens": data.max_tokens,
+        "pad_token_id": modelo_base.config.pad_token_id,
+    }
+
+    # Modo sampling vs determinista
+    if data.temperature > 0.0:
+        # Sampling estocástico
+        gen_kwargs["do_sample"] = True
+        gen_kwargs["temperature"] = data.temperature
+
+        # Parámetros opcionales de sampling
+        if data.top_p is not None:
+            gen_kwargs["top_p"] = data.top_p
+        if data.top_k is not None:
+            gen_kwargs["top_k"] = data.top_k
+    else:
+        # Modo determinista (greedy / beam por defecto)
+        gen_kwargs["do_sample"] = False
+
     # Generación (sin gradientes)
     with torch.inference_mode():
         outputs = modelo_base.generate(
             **inputs,
-            max_new_tokens=data.max_tokens,
-            do_sample=(data.temperature > 0.0),
-            temperature=data.temperature,
-            pad_token_id=modelo_base.config.pad_token_id,
+            **gen_kwargs,
         )
 
     decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
