@@ -19,28 +19,62 @@ app = FastAPI()
 # Available models (targeting a 3090)
 # ----------------------------------------------------------------------
 AVAILABLE_MODELS = {
+    # ------------------------------------------------------------------
+    # NIVEL 1: VELOCIDAD MÁXIMA (FP16 Nativo)
+    # ------------------------------------------------------------------
     "llama31-8b": {
         "id": "meta-llama/Llama-3.1-8B-Instruct",
         "needs_token": True,
-        "quant": None,   
+        "quant": None,   # ~16GB VRAM.
     },
     "qwen25-7b": {
         "id": "Qwen/Qwen2.5-7B-Instruct",
         "needs_token": False,
-        "quant": None,   
+        "quant": None,   # ~15GB VRAM.
     },
     "deepseek-r1-qwen-7b": {
         "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "needs_token": True,
-        "quant": None,   
+        "needs_token": False,
+        "quant": None,   # ~15GB VRAM.
     },
+
+    # ------------------------------------------------------------------
+    # NIVEL 2: PUNTO DULCE "SWEET SPOT" (Int8 - 8 bit)
+    # ------------------------------------------------------------------
     "mistral-nemo-12b": {
         "id": "mistralai/Mistral-Nemo-Instruct-2407",
         "needs_token": True,
-        "quant": 4,      
+        "quant": 8,      # ~13GB VRAM. Mucho mejor que 4-bit, más seguro que FP16.
     },
-}
+    "gemma2-9b": {
+        "id": "google/gemma-2-9b-it",
+        "needs_token": True,
+        "quant": None,   # Nota: Gemma 9B cabe en FP16 (~19GB), 
+    },
 
+    # ------------------------------------------------------------------
+    # NIVEL 3: INTELIGENCIA SUPERIOR (4-bit en GPU)
+    # ------------------------------------------------------------------
+    "qwen25-32b": {
+        "id": "Qwen/Qwen2.5-32B-Instruct",
+        "needs_token": False,
+        "quant": 4,      # ~18GB VRAM.
+    },
+
+    # ------------------------------------------------------------------
+    # NIVEL 4: CLASE "TITAN" (Offloading a CPU RAM)
+    # ------------------------------------------------------------------
+    "llama31-70b": {
+        "id": "meta-llama/Llama-3.1-70B-Instruct",
+        "needs_token": True,
+        "quant": 4,      # ~40GB Total.
+    },
+    "qwen25-72b": {
+        "id": "Qwen/Qwen2.5-72B-Instruct",
+        "needs_token": False,
+        "quant": 4,      # ~42GB Total.
+    }
+}
 # Cache of loaded models
 loaded_models = {}          
 active_model_name = None
@@ -59,7 +93,7 @@ class ChatMessage(BaseModel):
 
 class PredictionRequest(BaseModel):
     messages: List[ChatMessage]
-    max_tokens: int = 300              # maximum response tokens
+    max_tokens: int = 1024              # maximum response tokens
     temperature: float = 0.0           # 0 => deterministic, >0 => sampling
     top_p: Optional[float] = None      # nucleus sampling (optional)
     top_k: Optional[int] = None        # top-k sampling (optional)
@@ -79,6 +113,28 @@ def select_model(selection: ModelSelection):
 
     if name not in AVAILABLE_MODELS:
         raise HTTPException(status_code=404, detail=f"Model '{name}' is not available.")
+
+    if active_model_name is not None and active_model_name != name:
+            print(f"[INFO] Auto-unloading '{active_model_name}' to free VRAM...")
+            
+            # Eliminamos referencias del diccionario
+            if active_model_name in loaded_models:
+                del loaded_models[active_model_name]
+            
+            # Eliminamos referencias globales
+            del active_model
+            del tokenizer
+            
+            # Forzamos limpieza profunda
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # Reiniciamos variables de estado
+            active_model = None
+            tokenizer = None
+            loaded_models = {}
+            active_model_name = None
 
     model_cfg = AVAILABLE_MODELS[name]
     model_id = model_cfg["id"]
@@ -104,9 +160,26 @@ def select_model(selection: ModelSelection):
             trust_remote_code=True
         )
 
-        # Load Model
+        # Load Model (falta gestionar offload a RAM + quantización avanzada)
         if quant == 4:
-            quant_config = BitsAndBytesConfig(load_in_4bit=True)
+            print(f"[INFO] Loading in 4-bit quantization...")
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            local_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="auto",
+                quantization_config=quant_config,
+                token=auth_token,
+                trust_remote_code=True
+            )
+        elif quant == 8:
+            print(f"[INFO] Loading in 8-bit quantization...")
+            quant_config = BitsAndBytesConfig(
+                load_in_8bit=True
+            )
             local_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 device_map="auto",
@@ -115,6 +188,7 @@ def select_model(selection: ModelSelection):
                 trust_remote_code=True
             )
         else:
+            print(f"[INFO] Loading in native FP16...")
             local_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 device_map="auto",
@@ -231,6 +305,6 @@ def predict(request: PredictionRequest):
     generated_tokens = outputs[0][input_len:]
 
     # Decode only the response
-    response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    response_text = tokenizer.decode(generated_tokens, skip_special_tokens=False).strip() #falta gestionar special tokens
 
     return {"response": response_text}
