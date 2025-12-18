@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
+import asyncio
 import os
 import gc
 from dotenv import load_dotenv
@@ -80,6 +81,8 @@ loaded_models = {}
 active_model_name = None
 active_model = None         
 tokenizer = None            
+# Global lock to serialize model operations and inference
+model_lock = asyncio.Lock()
 
 # ----------------------------------------------------------------------
 # Request/response schemas
@@ -97,123 +100,125 @@ class PredictionRequest(BaseModel):
     temperature: float = 0.0           # 0 => deterministic, >0 => sampling
     top_p: Optional[float] = None      # nucleus sampling (optional)
     top_k: Optional[int] = None        # top-k sampling (optional)
+    seed: Optional[int] = None         # optional seed for reproducible sampling
 
 
 # ----------------------------------------------------------------------
 # Endpoints
 # ----------------------------------------------------------------------
 @app.post("/select-model")
-def select_model(selection: ModelSelection):
+async def select_model(selection: ModelSelection):
     """
     Download (if needed) and set a model as active.
     """
     global active_model_name, active_model, tokenizer, loaded_models
 
-    name = selection.name
+    async with model_lock:
+        name = selection.name
 
-    if name not in AVAILABLE_MODELS:
-        raise HTTPException(status_code=404, detail=f"Model '{name}' is not available.")
+        if name not in AVAILABLE_MODELS:
+            raise HTTPException(status_code=404, detail=f"Model '{name}' is not available.")
 
-    if active_model_name is not None and active_model_name != name:
-            print(f"[INFO] Auto-unloading '{active_model_name}' to free VRAM...")
-            
-            # Eliminamos referencias del diccionario
-            if active_model_name in loaded_models:
-                del loaded_models[active_model_name]
-            
-            # Eliminamos referencias globales
-            del active_model
-            del tokenizer
-            
-            # Forzamos limpieza profunda
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        if active_model_name is not None and active_model_name != name:
+                print(f"[INFO] Auto-unloading '{active_model_name}' to free VRAM...")
                 
-            # Reiniciamos variables de estado
-            active_model = None
-            tokenizer = None
-            loaded_models = {}
-            active_model_name = None
+                # Eliminamos referencias del diccionario
+                if active_model_name in loaded_models:
+                    del loaded_models[active_model_name]
+                
+                # Eliminamos referencias globales
+                del active_model
+                del tokenizer
+                
+                # Forzamos limpieza profunda
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+                # Reiniciamos variables de estado
+                active_model = None
+                tokenizer = None
+                loaded_models = {}
+                active_model_name = None
 
-    model_cfg = AVAILABLE_MODELS[name]
-    model_id = model_cfg["id"]
-    needs_token = model_cfg["needs_token"]
-    quant = model_cfg["quant"]
+        model_cfg = AVAILABLE_MODELS[name]
+        model_id = model_cfg["id"]
+        needs_token = model_cfg["needs_token"]
+        quant = model_cfg["quant"]
 
-    if needs_token and HF_TOKEN is None:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Model '{name}' requires HF_TOKEN set in the environment."
-        )
-
-    auth_token = HF_TOKEN if needs_token else None
-
-    # Download and cache if needed
-    if name not in loaded_models:
-        print(f"[INFO] Loading model '{model_id}' (alias: {name}) ...")
-
-        # Load Tokenizer
-        local_tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            token=auth_token,
-            trust_remote_code=True
-        )
-
-        # Load Model (falta gestionar offload a RAM + quantización avanzada)
-        if quant == 4:
-            print(f"[INFO] Loading in 4-bit quantization...")
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
+        if needs_token and HF_TOKEN is None:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Model '{name}' requires HF_TOKEN set in the environment."
             )
-            local_model = AutoModelForCausalLM.from_pretrained(
+
+        auth_token = HF_TOKEN if needs_token else None
+
+        # Download and cache if needed
+        if name not in loaded_models:
+            print(f"[INFO] Loading model '{model_id}' (alias: {name}) ...")
+
+            # Load Tokenizer
+            local_tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
-                device_map="auto",
-                quantization_config=quant_config,
-                token=auth_token,
-                trust_remote_code=True
-            )
-        elif quant == 8:
-            print(f"[INFO] Loading in 8-bit quantization...")
-            quant_config = BitsAndBytesConfig(
-                load_in_8bit=True
-            )
-            local_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map="auto",
-                quantization_config=quant_config,
-                token=auth_token,
-                trust_remote_code=True
-            )
-        else:
-            print(f"[INFO] Loading in native FP16...")
-            local_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map="auto",
-                dtype=torch.float16,
                 token=auth_token,
                 trust_remote_code=True
             )
 
-        # Ensure pad_token_id exists
-        if local_model.config.pad_token_id is None:
-            local_model.config.pad_token_id = local_tokenizer.eos_token_id
+            # Load Model (falta gestionar offload a RAM + quantización avanzada)
+            if quant == 4:
+                print(f"[INFO] Loading in 4-bit quantization...")
+                quant_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                )
+                local_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map="auto",
+                    quantization_config=quant_config,
+                    token=auth_token,
+                    trust_remote_code=True
+                )
+            elif quant == 8:
+                print(f"[INFO] Loading in 8-bit quantization...")
+                quant_config = BitsAndBytesConfig(
+                    load_in_8bit=True
+                )
+                local_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map="auto",
+                    quantization_config=quant_config,
+                    token=auth_token,
+                    trust_remote_code=True
+                )
+            else:
+                print(f"[INFO] Loading in native FP16...")
+                local_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map="auto",
+                    dtype=torch.float16,
+                    token=auth_token,
+                    trust_remote_code=True
+                )
 
-        local_model.eval()
-        loaded_models[name] = {
-            "model": local_model,
-            "tokenizer": local_tokenizer,
-        }
-        gc.collect()
+            # Ensure pad_token_id exists
+            if local_model.config.pad_token_id is None:
+                local_model.config.pad_token_id = local_tokenizer.eos_token_id
 
-    # Set active model
-    active_model_name = name
-    active_model = loaded_models[name]["model"]
-    tokenizer = loaded_models[name]["tokenizer"]
+            local_model.eval()
+            loaded_models[name] = {
+                "model": local_model,
+                "tokenizer": local_tokenizer,
+            }
+            gc.collect()
 
-    return {"message": f"Model '{name}' selected and ready."}
+        # Set active model
+        active_model_name = name
+        active_model = loaded_models[name]["model"]
+        tokenizer = loaded_models[name]["tokenizer"]
+
+        return {"message": f"Model '{name}' selected and ready."}
 
 
 @app.get("/model-status")
@@ -224,87 +229,95 @@ def model_status():
 
 
 @app.post("/unload-model")
-def unload_model():
+async def unload_model():
     global active_model_name, active_model, tokenizer, loaded_models
 
-    if active_model_name is None:
-        raise HTTPException(status_code=400, detail="No active model to unload.")
+    async with model_lock:
+        if active_model_name is None:
+            raise HTTPException(status_code=400, detail="No active model to unload.")
 
-    print(f"[INFO] Unloading model '{active_model_name}' from memory...")
+        print(f"[INFO] Unloading model '{active_model_name}' from memory...")
 
-    try:
-        del loaded_models[active_model_name]
-    except KeyError:
-        pass
+        try:
+            del loaded_models[active_model_name]
+        except KeyError:
+            pass
 
-    active_model_name = None
-    active_model = None
-    tokenizer = None
+        active_model_name = None
+        active_model = None
+        tokenizer = None
 
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    return {"message": "Model unloaded successfully."}
+        return {"message": "Model unloaded successfully."}
 
 
 @app.post("/predict")
-def predict(request: PredictionRequest):
+async def predict(request: PredictionRequest):
     """
     Generate a response using the active model.
     STRICT MODE: Uses apply_chat_template with return_tensors="pt".
     """
     global active_model_name, active_model, tokenizer
 
-    if active_model_name is None or active_model is None or tokenizer is None:
-        raise HTTPException(status_code=400, detail="No model is loaded.")
-    # Prepare conversation
-    conversation = [m.dict() for m in request.messages]
+    async with model_lock:
+        if active_model_name is None or active_model is None or tokenizer is None:
+            raise HTTPException(status_code=400, detail="No model is loaded.")
 
-    # Get device
-    first_param = next(active_model.parameters(), None)
-    device = first_param.device
+        # Per-request seeding for sampling scenarios
+        if request.seed is not None:
+            torch.manual_seed(request.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(request.seed)
+        # Prepare conversation
+        conversation = [m.dict() for m in request.messages]
 
-    # Apply Chat Template -> DIRECT TO TENSORS
-    try:
-        input_ids = tokenizer.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(device)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error applying chat template: {str(e)}"
-        )
-    attention_mask = torch.ones_like(input_ids)
-    # Calculate input length for slicing later
-    input_len = input_ids.shape[1]
+        # Get device
+        first_param = next(active_model.parameters(), None)
+        device = first_param.device
 
-    # Generation config
-    gen_kwargs = {
-        "max_new_tokens": request.max_tokens,
-        "pad_token_id": active_model.config.pad_token_id,
-        "do_sample": request.temperature > 0.0,
-    }
+        # Apply Chat Template -> DIRECT TO TENSORS
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                conversation,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            ).to(device)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error applying chat template: {str(e)}"
+            )
+        attention_mask = torch.ones_like(input_ids)
+        # Calculate input length for slicing later
+        input_len = input_ids.shape[1]
 
-    if request.temperature > 0.0:
-        gen_kwargs["temperature"] = request.temperature
-        if request.top_p: gen_kwargs["top_p"] = request.top_p
-        if request.top_k: gen_kwargs["top_k"] = request.top_k
+        # Generation config
+        gen_kwargs = {
+            "max_new_tokens": request.max_tokens,
+            "pad_token_id": active_model.config.pad_token_id,
+            "do_sample": request.temperature > 0.0,
+        }
 
-    # Generate
-    with torch.inference_mode():
-        outputs = active_model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            **gen_kwargs
-        )
+        if request.temperature > 0.0:
+            gen_kwargs["temperature"] = request.temperature
+            if request.top_p: gen_kwargs["top_p"] = request.top_p
+            if request.top_k: gen_kwargs["top_k"] = request.top_k
 
-    # Slice off the prompt (Input)
-    generated_tokens = outputs[0][input_len:]
+        # Generate
+        with torch.inference_mode():
+            outputs = active_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs
+            )
 
-    # Decode only the response
-    response_text = tokenizer.decode(generated_tokens, skip_special_tokens=False).strip() #falta gestionar special tokens
+        # Slice off the prompt (Input)
+        generated_tokens = outputs[0][input_len:]
 
-    return {"response": response_text}
+        # Decode only the response
+        response_text = tokenizer.decode(generated_tokens, skip_special_tokens=False).strip() #falta gestionar special tokens
+
+        return {"response": response_text}
