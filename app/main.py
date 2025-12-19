@@ -26,17 +26,20 @@ AVAILABLE_MODELS = {
     "llama31-8b": {
         "id": "meta-llama/Llama-3.1-8B-Instruct",
         "needs_token": True,
-        "quant": None,   # ~16GB VRAM.
+        "quant": None,
+        "attn": "flash_attention_2",
     },
     "qwen25-7b": {
         "id": "Qwen/Qwen2.5-7B-Instruct",
         "needs_token": False,
-        "quant": None,   # ~15GB VRAM.
+        "quant": None,
+        "attn": "flash_attention_2",
     },
     "deepseek-r1-qwen-7b": {
         "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "needs_token": False,
-        "quant": None,   # ~15GB VRAM.
+        "quant": None,
+        "attn": "sdpa",
     },
 
     # ------------------------------------------------------------------
@@ -45,12 +48,14 @@ AVAILABLE_MODELS = {
     "mistral-nemo-12b": {
         "id": "mistralai/Mistral-Nemo-Instruct-2407",
         "needs_token": True,
-        "quant": 8,      # ~13GB VRAM. Mucho mejor que 4-bit, más seguro que FP16.
+        "quant": 8,
+        "attn": "sdpa",
     },
     "gemma2-9b": {
         "id": "google/gemma-2-9b-it",
         "needs_token": True,
-        "quant": None,   # Nota: Gemma 9B cabe en FP16 (~19GB), 
+        "quant": None,
+        "attn": "sdpa"
     },
 
     # ------------------------------------------------------------------
@@ -59,7 +64,8 @@ AVAILABLE_MODELS = {
     "qwen25-32b": {
         "id": "Qwen/Qwen2.5-32B-Instruct",
         "needs_token": False,
-        "quant": 4,      # ~18GB VRAM.
+        "quant": 4,
+        "attn": "flash_attention_2",
     },
 
     # ------------------------------------------------------------------
@@ -68,12 +74,14 @@ AVAILABLE_MODELS = {
     "llama31-70b": {
         "id": "meta-llama/Llama-3.1-70B-Instruct",
         "needs_token": True,
-        "quant": 4,      # ~40GB Total.
+        "quant": 4,
+        "attn": "flash_attention_2",
     },
     "qwen25-72b": {
         "id": "Qwen/Qwen2.5-72B-Instruct",
         "needs_token": False,
-        "quant": 4,      # ~42GB Total.
+        "quant": 4,
+        "attn": "flash_attention_2",
     }
 }
 # Cache of loaded models
@@ -146,6 +154,8 @@ async def select_model(selection: ModelSelection):
         needs_token = model_cfg["needs_token"]
         quant = model_cfg["quant"]
 
+        attn_impl = model_cfg.get("attn", "sdpa")
+
         if needs_token and HF_TOKEN is None:
             raise HTTPException(
                 status_code=401,
@@ -165,6 +175,13 @@ async def select_model(selection: ModelSelection):
                 trust_remote_code=True
             )
 
+            common_args = {
+                            "device_map": "auto",
+                            "token": auth_token,
+                            "trust_remote_code": True,
+                            "attn_implementation": attn_impl
+                        }
+            
             # Load Model (falta gestionar offload a RAM + quantización avanzada)
             if quant == 4:
                 print(f"[INFO] Loading in 4-bit quantization...")
@@ -175,10 +192,8 @@ async def select_model(selection: ModelSelection):
                 )
                 local_model = AutoModelForCausalLM.from_pretrained(
                     model_id,
-                    device_map="auto",
                     quantization_config=quant_config,
-                    token=auth_token,
-                    trust_remote_code=True
+                    **common_args
                 )
             elif quant == 8:
                 print(f"[INFO] Loading in 8-bit quantization...")
@@ -187,19 +202,15 @@ async def select_model(selection: ModelSelection):
                 )
                 local_model = AutoModelForCausalLM.from_pretrained(
                     model_id,
-                    device_map="auto",
                     quantization_config=quant_config,
-                    token=auth_token,
-                    trust_remote_code=True
+                    **common_args
                 )
             else:
                 print(f"[INFO] Loading in native FP16...")
                 local_model = AutoModelForCausalLM.from_pretrained(
                     model_id,
-                    device_map="auto",
                     dtype=torch.float16,
-                    token=auth_token,
-                    trust_remote_code=True
+                    **common_args
                 )
 
             # Ensure pad_token_id exists
