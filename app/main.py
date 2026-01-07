@@ -459,6 +459,10 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
     async with model_lock:
         await _load_and_set_model(request.model)
 
+        # Hard rule:
+        # If json_schema is provided, we MUST ignore stop sequences to avoid truncating JSON mid-object.
+        effective_stop = None if request.json_schema is not None else request.stop
+
         # If a JSON schema is provided, enforce: generate -> extract JSON -> validate -> minify.
         if request.json_schema is not None:
             msgs_base = [m.dict() for m in request.messages]
@@ -484,7 +488,7 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
                     request.top_p,
                     request.top_k,
                     request.seed,
-                    stop=None
+                    stop=effective_stop
                 )
                 last_text = response_text or ""
                 try:
@@ -515,7 +519,7 @@ async def chat_completions(request: OpenAIChatCompletionRequest):
                 request.top_p,
                 request.top_k,
                 request.seed,
-                stop=request.stop
+                stop=effective_stop
             )
 
     return {
